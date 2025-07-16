@@ -18,6 +18,10 @@ class UAClient:
             self.connected = False
             self.initialized = True
             self.node_cache = {}
+            self.start_signal = None
+            # Add robot availability
+            self.robot_available = True
+            self.condition = asyncio.Condition()
 
     async def connect(self):
         """连接到OPC UA服务器"""
@@ -37,13 +41,20 @@ class UAClient:
                 self._myvar_y = await self.myobj.get_child("2:MyVariableY")
                 self._grid_m = await self.myobj.get_child("2:GridM")
                 self._grid_n = await self.myobj.get_child("2:GridN")
+                self.lv = await self.myobj.get_child("2:StainLevel")
+                self.machine_id = await self.myobj.get_child("2:MachineID")
+                self.robot_available = await self.myobj.get_child("2:RobotAvailable")
+                self.start_signal = await self.myobj.get_child("2:ActionSignal")
 
                 # 将变量存储在缓存中
                 self.node_cache = {
                     'x': self._myvar_x,
                     'y': self._myvar_y,
                     'm': self._grid_m,
-                    'n': self._grid_n
+                    'n': self._grid_n,
+                    'lv': self.lv,
+                    'mach_id': self.machine_id,
+                    'start_signal': self.start_signal
                 }
 
                 _logger.info("Successfully retrieved OPC UA nodes")
@@ -67,6 +78,19 @@ class UAClient:
         if not self.connected:
             await self.connect()
 
+    async def on_robot_available_change(self, datachange_notification):
+        """处理机器人可用性更改"""
+        value = datachange_notification.MonitoredItem.Value.Value.Value
+        async with self.condition:
+            self.robot_available = value
+            self.condition.notify_all() # 唤醒所有等待的协程
+
+    async def ensure_robot_available(self):
+        """确保机器人可用"""
+        async with self.condition:
+            while not self.robot_available:
+                await self.condition.wait()
+
     async def update_variables(self, x=None, y=None, m=None, n=None, lv=None, mach_id=None):
         """
         更新OPC UA服务器上的变量
@@ -84,7 +108,7 @@ class UAClient:
 
         try:
             await self.ensure_connected()
-
+            await self.start_signal.write_value(True)
             # if no value provided, use default values
             if x is not None:
                 await self._myvar_x.write_value(x)
@@ -104,6 +128,8 @@ class UAClient:
                 # "lv": await self._stain_level.get_value() if lv is not None else None,
                 # "mach_id": await self._machine_id.get_value() if mach_id is not None else None,
             }
+            await asyncio.sleep(5)
+            # await self.start_signal.write_value(False)
 
             # check the values
             if x is not None and current_values["x"] != x:
@@ -120,7 +146,6 @@ class UAClient:
                 _logger.warning(f"Some variable updates failed: {result['failed_updates']}")
             else:
                 _logger.info(f"Successfully updated variables: x={x}, y={y}, m={m}, n={n}")
-
             return result
 
         except Exception as e:
